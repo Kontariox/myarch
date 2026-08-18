@@ -35,16 +35,35 @@ while IFS= read -r package || [[ -n "$package" ]]; do
         echo "==> Klonowanie $package z AUR..."
         git clone "https://aur.archlinux.org/$package.git" "$PKG_BUILD_DIR"
     else
-        echo "==> Aktualizacja $package..."
+        echo "==> Sprawdzanie zmian w AUR..."
         git -C "$PKG_BUILD_DIR" pull --ff-only
     fi
 
     cd "$PKG_BUILD_DIR"
 
-    echo "==> Budowanie $package..."
+    # Pobierz informacje o wersji pakietu z PKGBUILD
+    PKGNAME=$(makepkg --printsrcinfo | awk '$1 == "pkgname" {print $3; exit}')
+    PKGVER=$(makepkg --printsrcinfo | awk '$1 == "pkgver" {print $3; exit}')
+    PKGREL=$(makepkg --printsrcinfo | awk '$1 == "pkgrel" {print $3; exit}')
 
-    # Budujemy jako zwykły użytkownik.
-    # makepkg nie powinien być uruchamiany jako root.
+
+    VERSION="${PKGVER}-${PKGREL}"
+
+    echo "==> Wersja AUR: $PKGNAME-$VERSION"
+
+    # Sprawdź, czy dokładnie taka wersja już istnieje
+    if compgen -G "$REPO_DIR/$PKGNAME-$VERSION-*.pkg.tar.zst" > /dev/null; then
+        echo "==> $PKGNAME-$VERSION już jest w repo."
+        echo "==> Pomijam budowanie."
+        continue
+    fi
+
+    echo "==> Brak tej wersji w repo."
+    echo "==> Budowanie $PKGNAME..."
+
+    # Usuń stare artefakty z katalogu budowania
+    rm -f ./*.pkg.tar.zst
+
     makepkg -sf --noconfirm
 
     echo "==> Kopiowanie pakietu do lokalnego repo..."
@@ -58,10 +77,15 @@ echo "==> Aktualizacja lokalnego repozytorium..."
 
 cd "$REPO_DIR"
 
+# Usuń stare bazy repo
+rm -f "$REPO_NAME.db" "$REPO_NAME.files"
+rm -f "$REPO_NAME.db.tar.gz" "$REPO_NAME.files.tar.gz"
+
 repo-add "$REPO_NAME.db.tar.gz" ./*.pkg.tar.zst
 
 echo
 echo "==> Budowanie archiso..."
+cd "$BASE"
 
 mkarchiso -v \
     -w "$WORK" \
