@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Re-generate initramfs images
+mkinitcpio -P
+
+# Create loader configuration
+cat > /boot/loader/loader.conf <<EOF
+default  arch.conf
+timeout  0
+console-mode max
+editor   no
+EOF
+
+# Create boot entry
+ROOT_UUID=$(findmnt -no UUID /)
+cat > /boot/loader/entries/arch.conf <<EOF
+title    Arch Linux
+linux    /vmlinuz-linux
+initrd   /initramfs-linux.img
+options  quiet splash root=UUID=$ROOT_UUID rw
+EOF
