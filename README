@@ -1,0 +1,1 @@
+If you want to add extensios and it doesn't have schema use glib-compile-schemas ./
