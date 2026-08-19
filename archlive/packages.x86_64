@@ -180,6 +180,7 @@ xdg-desktop-portal-gnome
 xdg-user-dirs-gtk
 
 gnome-rounded-blur
+extension-manager
 #end gnome
 
 #calamares
