@@ -1476,3 +1476,7 @@
   background-image: url("./media/highlight_stacked_bg_h.svg");
   background-position: 0px 0px;
   background-size: contain; }
+
+#dashtodockContainer #dash .dash-background {
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}
