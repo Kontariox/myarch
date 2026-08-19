@@ -1,1 +1,8 @@
 If you want to add extensios and it doesn't have schema use glib-compile-schemas ./
+
+i added border to dash-to-dock:
+```
+#dashtodockContainer #dash .dash-background {
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}
+```
