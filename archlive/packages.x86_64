@@ -197,6 +197,20 @@ python-jsonschema
 kcrash
 #end calamares
 
-yay
+base-devel
 networkmanager
+flatpak
+steam
+spotify-launcher
+
+
+###AUR###
+jetbrains-toolbox
+antigravity-cli
+anydesk-bin
+visual-studio-code-bin
+yay
+termius-bin
+rustdesk-bin
+google-chrome
 
