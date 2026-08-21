@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+echo "========================================="
+echo "       Sunshine - instalacja Arch"
+echo "========================================="
+echo
+
+# Musimy być uruchomieni jako zwykły użytkownik,
+# ponieważ Sunshine działa jako user service.
+if [[ $EUID -eq 0 ]]; then
+    echo "Nie uruchamiaj tego skryptu jako root."
+    echo "Uruchom go jako zwykły użytkownik z dostępem do sudo."
+    exit 1
+fi
+
+echo "[1/6] Aktualizacja systemu..."
+sudo pacman -Syu --noconfirm
+
+echo
+echo "[2/6] Wykrywanie GPU..."
+
+GPU_INFO="$(lspci | grep -Ei 'VGA|3D|Display' || true)"
+
+if [[ -z "$GPU_INFO" ]]; then
+    echo "Nie udało się wykryć GPU."
+    echo "Instaluję Sunshine bez dodatkowych sterowników GPU."
+else
+    echo "$GPU_INFO"
+fi
+
+echo
+
+# NVIDIA
+if echo "$GPU_INFO" | grep -qi 'NVIDIA'; then
+    echo "[3/6] Wykryto NVIDIA."
+
+    sudo pacman -S --needed --noconfirm \
+        nvidia-utils \
+        libva-nvidia-driver
+
+# AMD
+elif echo "$GPU_INFO" | grep -qi 'AMD\|ATI'; then
+    echo "[3/6] Wykryto AMD."
+
+    sudo pacman -S --needed --noconfirm \
+        mesa \
+        libva-mesa-driver \
+        vulkan-radeon
+
+# Intel
+elif echo "$GPU_INFO" | grep -qi 'Intel'; then
+    echo "[3/6] Wykryto Intel."
+
+    sudo pacman -S --needed --noconfirm \
+        mesa \
+        libva-intel-driver \
+        vulkan-intel
+
+else
+    echo "[3/6] Nie rozpoznano GPU - pomijam dodatkowe sterowniki."
+fi
+
+echo
+echo "[4/6] Instalacja Sunshine z repozytorium..."
+
+sudo pacman -S --needed --noconfirm sunshine
+
+echo
+echo "[5/6] Włączanie usługi Sunshine..."
+
+systemctl --user daemon-reload
+
+systemctl --user enable app-dev.lizardbyte.app.Sunshine
+systemctl --user restart app-dev.lizardbyte.app.Sunshine
+
+echo
+echo "[6/6] Sprawdzanie statusu..."
+
+sleep 2
+
+if systemctl --user is-active --quiet sunshine.service; then
+    echo
+    echo "========================================="
+    echo " Sunshine działa poprawnie!"
+    echo "========================================="
+    echo
+    systemctl --user --no-pager status sunshine.service
+    echo
+    echo "Panel Sunshine:"
+    echo "https://localhost:47990"
+    echo
+    echo "Jeżeli otwierasz panel z innego urządzenia:"
+    echo "https://ADRES_IP_TWOJEGO_PC:47990"
+    echo
+    echo "Logi:"
+    echo "journalctl --user -u sunshine.service -f"
+    echo
+else
+    echo
+    echo "========================================="
+    echo " UWAGA: Sunshine nie wystartował."
+    echo "========================================="
+    echo
+    systemctl --user --no-pager status sunshine.service || true
+    echo
+    echo "Logi:"
+    echo "journalctl --user -u sunshine.service --no-pager -n 100"
+    exit 1
+fi

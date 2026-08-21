@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# KVM/QEMU + libvirt + virt-manager installer for Arch Linux
+#
+# Uruchom:
+#   bash install-vm.sh
+#
+# Skrypt:
+#   - aktualizuje system
+#   - sprawdza CPU i wirtualizację
+#   - instaluje QEMU/KVM
+#   - instaluje libvirt
+#   - instaluje virt-manager
+#   - instaluje UEFI/OVMF
+#   - instaluje TPM emulator
+#   - dodaje użytkownika do grupy libvirt
+#   - uruchamia libvirt
+#   - uruchamia domyślną sieć libvirt
+#   - wykonuje testy końcowe
+# ============================================================
+
+set -Eeuo pipefail
+
+# ------------------------------------------------------------
+# Kolory / komunikaty
+# ------------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+info() {
+    echo -e "${BLUE}[INFO]${RESET} $*"
+}
+
+success() {
+    echo -e "${GREEN}[OK]${RESET} $*"
+}
+
+warning() {
+    echo -e "${YELLOW}[UWAGA]${RESET} $*"
+}
+
+error() {
+    echo -e "${RED}[BŁĄD]${RESET} $*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+section() {
+    echo
+    echo -e "${CYAN}${BOLD}============================================================${RESET}"
+    echo -e "${CYAN}${BOLD} $*${RESET}"
+    echo -e "${CYAN}${BOLD}============================================================${RESET}"
+    echo
+}
+
+# ------------------------------------------------------------
+# Obsługa błędów
+# ------------------------------------------------------------
+
+trap 'error "Skrypt zakończył się błędem w linii $LINENO."' ERR
+
+# ------------------------------------------------------------
+# Sprawdzenie systemu
+# ------------------------------------------------------------
+
+section "Sprawdzanie systemu"
+
+if [[ ! -f /etc/arch-release ]]; then
+    die "Ten skrypt jest przeznaczony dla Arch Linux."
+fi
+
+if [[ "${EUID}" -eq 0 ]]; then
+    die "Nie uruchamiaj tego skryptu jako root. Uruchom go jako zwykły użytkownik:
+
+    bash install-vm.sh"
+fi
+
+CURRENT_USER="${USER}"
+CURRENT_UID="$(id -u)"
+
+info "Użytkownik: ${CURRENT_USER}"
+info "UID: ${CURRENT_UID}"
+
+if ! command -v sudo >/dev/null 2>&1; then
+    die "Brakuje sudo. Zainstaluj sudo i uruchom skrypt ponownie."
+fi
+
+if ! sudo -v; then
+    die "Nie udało się uzyskać uprawnień sudo."
+fi
+
+success "Uprawnienia sudo są dostępne."
+
+# ------------------------------------------------------------
+# Sprawdzenie architektury
+# ------------------------------------------------------------
+
+ARCH="$(uname -m)"
+
+if [[ "${ARCH}" != "x86_64" ]]; then
+    warning "Wykryto architekturę: ${ARCH}"
+    warning "Ten skrypt jest przede wszystkim przygotowany dla x86_64."
+fi
+
+info "Architektura: ${ARCH}"
+
+# ------------------------------------------------------------
+# Sprawdzenie CPU i wirtualizacji
+# ------------------------------------------------------------
+
+section "Sprawdzanie obsługi wirtualizacji"
+
+CPU_VENDOR="$(lscpu | awk -F: '/Vendor ID:/ {gsub(/^[ \t]+/, "", $2); print $2}')"
+
+info "Producent CPU: ${CPU_VENDOR}"
+
+VIRT_FLAG=""
+
+if grep -qw "vmx" /proc/cpuinfo; then
+    VIRT_FLAG="vmx"
+    success "Wykryto Intel VT-x (vmx)."
+elif grep -qw "svm" /proc/cpuinfo; then
+    VIRT_FLAG="svm"
+    success "Wykryto AMD-V (svm)."
+else
+    warning "Nie wykryto flagi vmx/svm w /proc/cpuinfo."
+    warning "Wirtualizacja sprzętowa może być wyłączona w BIOS/UEFI."
+fi
+
+# ------------------------------------------------------------
+# Sprawdzenie modułu KVM
+# ------------------------------------------------------------
+
+if [[ "${VIRT_FLAG}" == "vmx" ]]; then
+    KVM_MODULE="kvm_intel"
+elif [[ "${VIRT_FLAG}" == "svm" ]]; then
+    KVM_MODULE="kvm_amd"
+else
+    KVM_MODULE=""
+fi
+
+if [[ -n "${KVM_MODULE}" ]]; then
+    if lsmod | grep -q "^${KVM_MODULE}"; then
+        success "Moduł ${KVM_MODULE} jest już załadowany."
+    else
+        info "Próba załadowania modułu ${KVM_MODULE}..."
+        if sudo modprobe "${KVM_MODULE}"; then
+            success "Moduł ${KVM_MODULE} został załadowany."
+        else
+            warning "Nie udało się załadować ${KVM_MODULE}."
+            warning "Sprawdź ustawienia wirtualizacji w BIOS/UEFI."
+        fi
+    fi
+fi
+
+if [[ -e /dev/kvm ]]; then
+    success "/dev/kvm jest dostępne."
+else
+    warning "/dev/kvm nie jest obecnie dostępne."
+    warning "Po instalacji wykonamy ponowną kontrolę."
+fi
+
+# ------------------------------------------------------------
+# Aktualizacja systemu
+# ------------------------------------------------------------
+
+section "Aktualizacja Arch Linux"
+
+info "Synchronizacja baz pakietów i aktualizacja systemu..."
+
+sudo pacman -Syu --noconfirm
+
+success "System został zaktualizowany."
+
+# ------------------------------------------------------------
+# Instalacja pakietów
+# ------------------------------------------------------------
+
+section "Instalacja pakietów wirtualizacji"
+
+PACKAGES=(
+    "qemu-desktop"
+    "libvirt"
+    "virt-manager"
+    "edk2-ovmf"
+    "swtpm"
+    "dnsmasq"
+    "iptables-nft"
+    "dmidecode"
+)
+
+info "Instalowane pakiety z oficjalnych repozytoriów:"
+printf '  - %s\n' "${PACKAGES[@]}"
+echo
+
+sudo pacman -S --needed --noconfirm "${PACKAGES[@]}"
+
+success "Pakiety z oficjalnych repozytoriów zostały zainstalowane."
+
+# ------------------------------------------------------------
+# Instalacja bridge-utils z AUR przez yay
+# ------------------------------------------------------------
+
+section "Instalacja bridge-utils z AUR"
+
+if pacman -Q bridge-utils >/dev/null 2>&1; then
+    success "bridge-utils jest już zainstalowane."
+else
+
+    if command -v yay >/dev/null 2>&1; then
+        success "Znaleziono yay."
+
+    else
+        warning "yay nie jest zainstalowane."
+        info "Instalacja yay z AUR..."
+
+        TEMP_DIR="$(mktemp -d)"
+
+        cleanup_yay() {
+            rm -rf "${TEMP_DIR}"
+        }
+
+        trap cleanup_yay EXIT
+
+        git clone https://aur.archlinux.org/yay.git "${TEMP_DIR}/yay"
+
+        (
+            cd "${TEMP_DIR}/yay"
+            makepkg -si --noconfirm
+        )
+
+        if command -v yay >/dev/null 2>&1; then
+            success "yay zostało zainstalowane."
+        else
+            die "Nie udało się zainstalować yay."
+        fi
+
+        rm -rf "${TEMP_DIR}"
+        trap - EXIT
+    fi
+
+    info "Instalacja bridge-utils przez yay..."
+
+    yay -S --needed --noconfirm bridge-utils
+
+    if pacman -Q bridge-utils >/dev/null 2>&1; then
+        success "bridge-utils zostało zainstalowane."
+    else
+        die "Nie udało się zainstalować bridge-utils."
+    fi
+fi
+
+# ------------------------------------------------------------
+# Włączanie modułów KVM
+# ------------------------------------------------------------
+
+section "Konfiguracja KVM"
+
+if [[ -n "${KVM_MODULE}" ]]; then
+
+    info "Konfiguracja modułu ${KVM_MODULE}..."
+
+    if ! grep -q "^${KVM_MODULE}$" /etc/modules-load.d/kvm.conf 2>/dev/null; then
+        echo "${KVM_MODULE}" | sudo tee -a /etc/modules-load.d/kvm.conf >/dev/null
+    fi
+
+    if sudo modprobe "${KVM_MODULE}" 2>/dev/null; then
+        success "Moduł ${KVM_MODULE} jest aktywny."
+    else
+        warning "Nie udało się aktywować ${KVM_MODULE}."
+    fi
+
+fi
+
+if [[ -e /dev/kvm ]]; then
+    success "KVM jest dostępne: /dev/kvm"
+else
+    warning "Brak /dev/kvm."
+    warning "Jeżeli komputer jest fizycznym hostem, włącz Intel VT-x / AMD-V w BIOS/UEFI."
+fi
+
+# ------------------------------------------------------------
+# Grupa libvirt
+# ------------------------------------------------------------
+
+section "Konfiguracja użytkownika"
+
+if getent group libvirt >/dev/null 2>&1; then
+    success "Grupa libvirt już istnieje."
+else
+    info "Tworzenie grupy libvirt..."
+    sudo groupadd libvirt
+    success "Utworzono grupę libvirt."
+fi
+
+if id -nG "${CURRENT_USER}" | tr ' ' '\n' | grep -qx "libvirt"; then
+    success "Użytkownik ${CURRENT_USER} już należy do grupy libvirt."
+else
+    info "Dodawanie ${CURRENT_USER} do grupy libvirt..."
+    sudo usermod -aG libvirt "${CURRENT_USER}"
+    success "Użytkownik został dodany do grupy libvirt."
+fi
+
+# ------------------------------------------------------------
+# Usługi libvirt
+# ------------------------------------------------------------
+
+section "Uruchamianie libvirt"
+
+info "Włączanie libvirtd.service..."
+
+sudo systemctl enable --now libvirtd.service
+
+success "libvirtd.service działa."
+
+# Dodatkowo upewniamy się, że socket QEMU jest dostępny.
+if systemctl list-unit-files | grep -q "^libvirtd.socket"; then
+    sudo systemctl enable --now libvirtd.socket || true
+fi
+
+# ------------------------------------------------------------
+# Sprawdzenie usług
+# ------------------------------------------------------------
+
+info "Sprawdzanie statusu libvirt..."
+
+if systemctl is-active --quiet libvirtd.service; then
+    success "libvirtd.service: ACTIVE"
+else
+    warning "libvirtd.service nie jest aktywny."
+fi
+
+# ------------------------------------------------------------
+# Konfiguracja domyślnej sieci libvirt
+# ------------------------------------------------------------
+
+section "Konfiguracja sieci libvirt"
+
+if command -v virsh >/dev/null 2>&1; then
+
+    if sudo virsh net-info default >/dev/null 2>&1; then
+        success "Sieć 'default' istnieje."
+    else
+        warning "Sieć 'default' nie istnieje."
+    fi
+
+    if sudo virsh net-list --all | awk '$1=="default" {found=1} END {exit !found}'; then
+
+        if sudo virsh net-info default | grep -q "Active:.*yes"; then
+            success "Sieć 'default' jest aktywna."
+        else
+            info "Uruchamianie sieci 'default'..."
+            sudo virsh net-start default || true
+        fi
+
+        info "Włączanie autostartu sieci 'default'..."
+        sudo virsh net-autostart default || true
+
+    fi
+
+else
+    warning "virsh nie jest dostępny."
+fi
+
+# ------------------------------------------------------------
+# Domyślny storage pool
+# ------------------------------------------------------------
+
+section "Konfiguracja magazynu VM"
+
+if sudo virsh pool-info default >/dev/null 2>&1; then
+
+    success "Domyślny storage pool istnieje."
+
+    if sudo virsh pool-info default | grep -q "Autostart:.*yes"; then
+        success "Storage pool 'default' ma autostart."
+    else
+        info "Włączanie autostartu storage pool..."
+        sudo virsh pool-autostart default || true
+    fi
+
+    if sudo virsh pool-info default | grep -q "State:.*running"; then
+        success "Storage pool 'default' działa."
+    else
+        info "Uruchamianie storage pool..."
+        sudo virsh pool-start default || true
+    fi
+
+else
+
+    warning "Nie znaleziono domyślnego storage pool."
+
+    if [[ ! -d /var/lib/libvirt/images ]]; then
+        sudo mkdir -p /var/lib/libvirt/images
+    fi
+
+    sudo virsh pool-define-as \
+        default \
+        dir \
+        --target /var/lib/libvirt/images || true
+
+    sudo virsh pool-build default 2>/dev/null || true
+    sudo virsh pool-start default 2>/dev/null || true
+    sudo virsh pool-autostart default 2>/dev/null || true
+
+fi
+
+# ------------------------------------------------------------
+# Uprawnienia katalogu obrazów
+# ------------------------------------------------------------
+
+if [[ -d /var/lib/libvirt/images ]]; then
+    sudo chmod 755 /var/lib/libvirt/images
+    success "Katalog /var/lib/libvirt/images jest dostępny."
+fi
+
+# ------------------------------------------------------------
+# Test libvirt
+# ------------------------------------------------------------
+
+section "Test libvirt"
+
+if sudo virsh uri >/dev/null 2>&1; then
+    LIBVIRT_URI="$(sudo virsh uri)"
+    success "Libvirt URI: ${LIBVIRT_URI}"
+else
+    warning "Nie udało się połączyć z libvirt."
+fi
+
+# ------------------------------------------------------------
+# Test KVM
+# ------------------------------------------------------------
+
+section "Test KVM/QEMU"
+
+if [[ -e /dev/kvm ]]; then
+    success "KVM: OK"
+else
+    warning "KVM: BRAK /dev/kvm"
+fi
+
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    QEMU_VERSION="$(qemu-system-x86_64 --version | head -n1)"
+    success "QEMU: ${QEMU_VERSION}"
+else
+    warning "qemu-system-x86_64 nie został znaleziony."
+fi
+
+if command -v virsh >/dev/null 2>&1; then
+    VIRSH_VERSION="$(virsh --version)"
+    success "libvirt/virsh: ${VIRSH_VERSION}"
+fi
+
+if command -v virt-manager >/dev/null 2>&1; then
+    VM_VERSION="$(virt-manager --version 2>/dev/null || true)"
+    success "virt-manager: ${VM_VERSION}"
+fi
+
+# ------------------------------------------------------------
+# Test UEFI
+# ------------------------------------------------------------
+
+section "Test UEFI / OVMF"
+
+OVMF_FILES=(
+    "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+    "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd"
+)
+
+OVMF_OK=0
+
+for file in "${OVMF_FILES[@]}"; do
+    if [[ -f "${file}" ]]; then
+        success "Znaleziono: ${file}"
+        OVMF_OK=1
+    fi
+done
+
+if [[ "${OVMF_OK}" -eq 0 ]]; then
+    warning "Nie znaleziono plików OVMF."
+else
+    success "UEFI/OVMF: OK"
+fi
+
+# ------------------------------------------------------------
+# Test TPM
+# ------------------------------------------------------------
+
+section "Test TPM emulator"
+
+if command -v swtpm >/dev/null 2>&1; then
+    SWTPM_VERSION="$(swtpm --version 2>/dev/null | head -n1 || true)"
+    success "swtpm jest zainstalowany: ${SWTPM_VERSION}"
+else
+    warning "swtpm nie został znaleziony."
+fi
+
+# ------------------------------------------------------------
+# Informacja o grupie użytkownika
+# ------------------------------------------------------------
+
+section "Podsumowanie"
+
+echo
+echo -e "${GREEN}${BOLD}Instalacja zakończona.${RESET}"
+echo
+
+echo "Zainstalowane komponenty:"
+echo "  ✓ QEMU/KVM"
+echo "  ✓ libvirt"
+echo "  ✓ virt-manager"
+echo "  ✓ UEFI/OVMF"
+echo "  ✓ TPM emulator (swtpm)"
+echo "  ✓ domyślna sieć libvirt"
+echo "  ✓ domyślny storage pool"
+echo
+
+if [[ -e /dev/kvm ]]; then
+    echo -e "KVM:             ${GREEN}OK${RESET}"
+else
+    echo -e "KVM:             ${YELLOW}BRAK /dev/kvm${RESET}"
+fi
+
+if systemctl is-active --quiet libvirtd.service; then
+    echo -e "libvirt:         ${GREEN}OK${RESET}"
+else
+    echo -e "libvirt:         ${YELLOW}NIEAKTYWNY${RESET}"
+fi
+
+if sudo virsh net-info default >/dev/null 2>&1; then
+    if sudo virsh net-info default | grep -q "Active:.*yes"; then
+        echo -e "Sieć default:    ${GREEN}OK${RESET}"
+    else
+        echo -e "Sieć default:    ${YELLOW}NIEAKTYWNA${RESET}"
+    fi
+fi
+
+echo
+echo -e "${CYAN}${BOLD}WAŻNE:${RESET}"
+echo
+echo "Użytkownik ${CURRENT_USER} został dodany do grupy libvirt."
+echo
+echo "Aby zmiana grup zaczęła obowiązywać, wyloguj się i zaloguj ponownie."
+echo "Nie musisz ponownie uruchamiać całego systemu."
+echo
+echo "Po ponownym zalogowaniu uruchom:"
+echo
+echo "    virt-manager"
+echo
+echo "Powinieneś używać połączenia:"
+echo
+echo "    QEMU/KVM - system"
+echo
+echo "Do sprawdzenia możesz również wykonać:"
+echo
+echo "    virsh -c qemu:///system list --all"
+echo
+echo "    virsh -c qemu:///system net-list --all"
+echo
+
+# ------------------------------------------------------------
+# Opcjonalne uruchomienie virt-manager
+# ------------------------------------------------------------
+
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+
+    echo
+    read -r -p "Uruchomić teraz virt-manager? [T/n]: " START_VM
+
+    if [[ -z "${START_VM}" || "${START_VM}" =~ ^[TtYy]$ ]]; then
+        info "Uruchamianie virt-manager..."
+        nohup virt-manager >/dev/null 2>&1 &
+        success "virt-manager został uruchomiony."
+    fi
+
+else
+    info "Nie wykryto sesji graficznej. virt-manager nie został automatycznie uruchomiony."
+fi
+
+echo
+echo -e "${GREEN}${BOLD}Gotowe!${RESET}"
+echo
+
