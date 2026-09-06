@@ -1,21 +1,181 @@
 #!/bin/bash
 
-# Re-generate initramfs images
-mkinitcpio -P
+echo "==> [bootloader] Starting bootloader and initramfs configuration..."
 
-# Create loader configuration
-cat > /boot/loader/loader.conf <<EOF
+# 1. Ensure correct mkinitcpio preset is in place
+if [ -f /etc/mkinitcpio.d/linux-postinstall.preset ]; then
+    echo "==> [bootloader] Moving linux-postinstall.preset to linux.preset..."
+    mv -f /etc/mkinitcpio.d/linux-postinstall.preset /etc/mkinitcpio.d/linux.preset
+fi
+
+# 2. Ensure /etc/mkinitcpio.conf exists
+if [ ! -f /etc/mkinitcpio.conf ]; then
+    if [ -f /etc/calamares/extras/calamkinitcpio.conf ]; then
+        echo "==> [bootloader] Copying calamkinitcpio.conf to /etc/mkinitcpio.conf..."
+        cp /etc/calamares/extras/calamkinitcpio.conf /etc/mkinitcpio.conf
+    else
+        echo "==> [bootloader] Creating default /etc/mkinitcpio.conf..."
+        cat > /etc/mkinitcpio.conf << "MKCONF"
+MODULES=()
+BINARIES=()
+FILES=()
+HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+COMPRESSION="zstd"
+MKCONF
+    fi
+fi
+
+# 3. Detect if root filesystem is on LUKS
+ROOT_SOURCE=$(findmnt -no SOURCE / 2>/dev/null || true)
+ROOT_DEV="${ROOT_SOURCE%%\[*}"
+
+export IS_LUKS="false"
+LUKS_UUID=""
+MAPPER_NAME=""
+
+if [ -n "$ROOT_DEV" ] && [ -b "$ROOT_DEV" ]; then
+    DEV_TYPE=$(lsblk -no TYPE "$ROOT_DEV" 2>/dev/null | head -n1 || true)
+    if [ "$DEV_TYPE" = "crypt" ] || cryptsetup status "$ROOT_DEV" &>/dev/null; then
+        export IS_LUKS="true"
+        MAPPER_NAME=$(basename "$ROOT_DEV")
+
+        # Find underlying physical/parent device
+        PARENT_DEV=$(cryptsetup status "$ROOT_DEV" 2>/dev/null | awk "/device:/ {print \$2}" || true)
+
+        if [ -z "$PARENT_DEV" ] || [ ! -b "$PARENT_DEV" ]; then
+            DM_NODE=$(realpath "$ROOT_DEV" 2>/dev/null || echo "$ROOT_DEV")
+            DM_NAME=$(basename "$DM_NODE")
+            SLAVE=$(ls /sys/class/block/"$DM_NAME"/slaves 2>/dev/null | head -n1 || true)
+            if [ -n "$SLAVE" ]; then
+                PARENT_DEV="/dev/$SLAVE"
+            fi
+        fi
+
+        if [ -z "$PARENT_DEV" ] || [ ! -b "$PARENT_DEV" ]; then
+            PARENT_DEV=$(lsblk -sno PATH "$ROOT_DEV" 2>/dev/null | sed 1d | head -n1 || true)
+        fi
+
+        # Find LUKS UUID of the underlying device
+        if [ -n "$PARENT_DEV" ] && [ -b "$PARENT_DEV" ]; then
+            LUKS_UUID=$(cryptsetup luksUUID "$PARENT_DEV" 2>/dev/null || blkid -s UUID -o value "$PARENT_DEV" || true)
+        fi
+
+        # Fallback to /etc/crypttab if available
+        if [ -z "$LUKS_UUID" ] && [ -f /etc/crypttab ]; then
+            LUKS_UUID=$(awk -v m="$MAPPER_NAME" "\$1 == m {print \$2}" /etc/crypttab | sed "s/UUID=//" || true)
+        fi
+
+        # Fallback if mapper name is formatted like luks-<UUID>
+        if [ -z "$LUKS_UUID" ] && [[ "$MAPPER_NAME" =~ ^luks-(.+)$ ]]; then
+            LUKS_UUID="${BASH_REMATCH[1]}"
+        fi
+
+        echo "==> [bootloader] Detected LUKS encrypted root partition:"
+        echo "    Mapper: $MAPPER_NAME"
+        echo "    Parent: ${PARENT_DEV:-unknown}"
+        echo "    LUKS UUID: $LUKS_UUID"
+    else
+        echo "==> [bootloader] Root partition is unencrypted ($ROOT_DEV)"
+    fi
+else
+    echo "==> [bootloader] Warning: Could not find root device ($ROOT_SOURCE)"
+fi
+
+# 4. Configure /etc/mkinitcpio.conf hooks
+python3 - << "PYEOF"
+import os, re, sys
+
+conf_path = "/etc/mkinitcpio.conf"
+try:
+    with open(conf_path, "r") as f:
+        content = f.read()
+except Exception as e:
+    print(f"==> [bootloader] Could not read {conf_path}: {e}")
+    sys.exit(0)
+
+m = re.search(r"^\s*HOOKS=\((.*?)\)", content, re.MULTILINE)
+if m:
+    hooks = m.group(1).split()
+    is_luks = os.environ.get("IS_LUKS") == "true"
+
+    # Remove any existing encrypt / sd-encrypt
+    hooks = [h for h in hooks if h not in ("encrypt", "sd-encrypt")]
+
+    if is_luks:
+        # Ensure keyboard, keymap, consolefont are present before block/encrypt
+        needed = [req for req in ["keyboard", "keymap", "consolefont"] if req not in hooks]
+        if needed:
+            idx = hooks.index("block") if "block" in hooks else (hooks.index("filesystems") if "filesystems" in hooks else len(hooks))
+            hooks[idx:idx] = needed
+
+        # Place encrypt hook right before filesystems
+        if "filesystems" in hooks:
+            hooks.insert(hooks.index("filesystems"), "encrypt")
+        else:
+            hooks.append("encrypt")
+
+    new_hooks = "HOOKS=(" + " ".join(hooks) + ")"
+    new_content = content[:m.start()] + new_hooks + content[m.end():]
+
+    with open(conf_path, "w") as f:
+        f.write(new_content)
+    print(f"==> [bootloader] Updated {conf_path}: {new_hooks}")
+PYEOF
+
+# 5. Re-generate initramfs images
+echo "==> [bootloader] Generating initramfs..."
+mkinitcpio -P || echo "==> [bootloader] Warning: mkinitcpio returned non-zero exit code"
+
+# 6. Ensure entries directory exists
+mkdir -p /boot/loader/entries
+
+# 7. Create loader configuration
+echo "==> [bootloader] Configuring systemd-boot loader.conf..."
+cat > /boot/loader/loader.conf << "EOF"
 default  arch.conf
 timeout  0
 console-mode max
 editor   no
 EOF
 
-# Create boot entry
-ROOT_UUID=$(findmnt -no UUID /)
-cat > /boot/loader/entries/arch.conf <<EOF
+# 8. Determine kernel options
+ROOT_FS=$(findmnt -no FSTYPE / 2>/dev/null || true)
+ROOT_FSROOT=$(findmnt -no FSROOT / 2>/dev/null || true)
+SUBVOL_OPT=""
+if [ "$ROOT_FS" = "btrfs" ] && [ -n "$ROOT_FSROOT" ] && [ "$ROOT_FSROOT" != "/" ]; then
+    SUBVOL_OPT="rootflags=subvol=${ROOT_FSROOT#/}"
+fi
+
+if [ "$IS_LUKS" = "true" ] && [ -n "$LUKS_UUID" ] && [ -n "$MAPPER_NAME" ]; then
+    OPTIONS="quiet splash cryptdevice=UUID=${LUKS_UUID}:${MAPPER_NAME} root=/dev/mapper/${MAPPER_NAME} rw"
+else
+    ROOT_UUID=$(findmnt -no UUID / 2>/dev/null || blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null || true)
+    OPTIONS="quiet splash root=UUID=${ROOT_UUID} rw"
+fi
+
+if [ -n "$SUBVOL_OPT" ]; then
+    OPTIONS="$OPTIONS $SUBVOL_OPT"
+fi
+
+# 9. Create boot entry
+echo "==> [bootloader] Creating /boot/loader/entries/arch.conf..."
+echo "==> [bootloader] Kernel options: $OPTIONS"
+cat > /boot/loader/entries/arch.conf << EOF
 title    Arch Linux
 linux    /vmlinuz-linux
 initrd   /initramfs-linux.img
-options  quiet splash root=UUID=$ROOT_UUID rw
+options  $OPTIONS
 EOF
+
+# 10. Create fallback entry if fallback image exists
+if [ -f /boot/initramfs-linux-fallback.img ]; then
+    echo "==> [bootloader] Creating /boot/loader/entries/arch-fallback.conf..."
+    cat > /boot/loader/entries/arch-fallback.conf << EOF
+title    Arch Linux (fallback initramfs)
+linux    /vmlinuz-linux
+initrd   /initramfs-linux-fallback.img
+options  $OPTIONS
+EOF
+fi
+
+echo "==> [bootloader] Bootloader setup completed successfully."
