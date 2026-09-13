@@ -8,7 +8,7 @@ bcachefs-tools
 bind
 bolt
 brltty
-broadcom-wl
+broadcom-wl-dkms
 btrfs-progs
 clonezilla
 cloud-init
@@ -210,7 +210,9 @@ antigravity-cli
 anydesk-bin
 visual-studio-code-bin
 yay
+mkinitcpio-openswap
 termius-bin
 rustdesk-bin
 google-chrome
-
+gnome-online-accounts-googledrive
+gvfs-googledrive

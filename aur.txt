@@ -1,6 +1,7 @@
 calamares
 yay
 gnome-rounded-blur
+mkinitcpio-openswap
 jetbrains-toolbox
 antigravity-cli
 anydesk-bin
@@ -8,3 +9,5 @@ visual-studio-code-bin
 termius-bin
 rustdesk-bin
 google-chrome
+gnome-online-accounts-googledrive
+gvfs-googledrive
